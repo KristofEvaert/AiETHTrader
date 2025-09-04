@@ -1,575 +1,413 @@
+#!/usr/bin/env python3
 """
-AI Crypto Trading Pipeline for ETH/USDC using multiple timeframes.
-- Downloads up to 2 years of historical klines from Binance (Spot)
-  for intervals: 1m,5m,15m,30m,1h,4h,1d.
-- Builds a multi-timeframe feature set aligned to a base timeframe (15m by default).
-- Trains a simple PyTorch classifier to predict next-bar direction.
-- Backtests a threshold strategy on the validation set.
-- Optional live trading loop (default DRY_RUN / testnet).
+AiETHTrader - AI-Powered Crypto Trading Bot
+==========================================
 
-DISCLAIMER: Educational template. Crypto is risky. Test on TESTNET first.
+This module implements an AI trading bot that uses PyTorch neural networks
+to predict price movements and execute trades based on 1-hour charts with
+4-hour and daily trend analysis.
+
+Key Features:
+- 1-hour trading signals with 4h/1d trend confirmation
+- Buy and No-Trade signals only (no sell signals)
+- 3% minimum gain requirement for trade validation
+- Multi-timeframe technical analysis
 """
 
 import os
-import time
-import math
-import json
-import joblib
+import sys
+import argparse
 import yaml
-import pytz
-import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta, timezone
-
-from binance.spot import Spot as SpotClient
-from binance.error import ClientError
-
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, roc_auc_score
-
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import warnings
+warnings.filterwarnings('ignore')
 
-# -------------------- CONFIG --------------------
-
-DEFAULT_CONFIG = {
-    "symbol": "ETHUSDC",
-    "timeframes": ["1m","5m","15m","30m","1h","4h","1d"],
-    "base_timeframe": "15m",
-    "lookback_years": 2,
-    "label_horizon_bars": 1,     # predict next bar direction on base timeframe
-    "min_rows_per_tf": 300,       # sanity check
-    "train": {
-        "test_size": 0.2,
-        "random_state": 42,
-        "epochs": 20,
-        "batch_size": 512,
-        "lr": 1e-3,
-        "hidden_size": 128,
-        "dropout": 0.2
-    },
-    "backtest": {
-        "fee_bps": 10,           # 0.10%
-        "threshold": 0.55,       # probability to enter long
-        "hold_bars": 1
-    },
-    "live": {
-        "enabled": False,
-        "poll_seconds": 30,
-        "dry_run": True,
-        "trade_quote_size": 50.0,
-    },
-    "storage": {
-        "data_dir": "./data",
-        "artifacts_dir": "./artifacts"
-    },
-    "use_testnet": True
-}
-
-# Load .env if present (very lightweight parser)
-def load_env_file(path: str = ".env"):
-    if not os.path.exists(path): 
-        return {}
-    env = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line=line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k,v = line.split("=",1)
-            env[k.strip()] = v.strip()
-    return env
-
-# -------------------- BINANCE HELPERS --------------------
-
-INTERVAL_MS = {
-    "1m": 60_000,
-    "5m": 5*60_000,
-    "15m": 15*60_000,
-    "30m": 30*60_000,
-    "1h": 60*60_000,
-    "4h": 4*60*60_000,
-    "1d": 24*60*60_000,
-}
-
-def make_client(api_key:str, api_secret:str, use_testnet: bool):
-    base_url = "https://testnet.binance.vision" if use_testnet else "https://api.binance.com"
-    return SpotClient(api_key=api_key, api_secret=api_secret, base_url=base_url)
-
-def fetch_klines(client: SpotClient, symbol: str, interval: str, start_ts_ms: int, end_ts_ms: int, sleep_sec: float = 0.2) -> pd.DataFrame:
-    """
-    Paginate klines (max 1000 per request). Returns DataFrame with columns:
-    open_time, open, high, low, close, volume, close_time, quote_asset_volume, trades, taker_buy_base, taker_buy_quote
-    """
-    all_rows = []
-    limit = 1000
-    cur = start_ts_ms
-    step = INTERVAL_MS[interval]*limit
-    while cur < end_ts_ms:
-        try:
-            res = client.klines(symbol=symbol, interval=interval, startTime=cur, endTime=min(end_ts_ms, cur+step-1), limit=limit)
-        except ClientError as e:
-            print(f"[WARN] Klines error {e}. Sleeping and retrying...")
-            time.sleep(2)
-            continue
-        if not res:
-            break
-        all_rows.extend(res)
-        last_open = res[-1][0]
-        next_start = last_open + INTERVAL_MS[interval]
-        if next_start <= cur:
-            # safety to avoid infinite loop
-            next_start = cur + INTERVAL_MS[interval]
-        cur = next_start
-        time.sleep(sleep_sec)
-    if not all_rows:
-        return pd.DataFrame()
-    cols = ["open_time","open","high","low","close","volume","close_time","quote_asset_volume","trades","taker_buy_base","taker_buy_quote","ignore"]
-    df = pd.DataFrame(all_rows, columns=cols)
-    df = df.drop(columns=["ignore"])
-    # Convert types
-    num_cols = ["open","high","low","close","volume","quote_asset_volume","taker_buy_base","taker_buy_quote"]
-    df[num_cols] = df[num_cols].astype(float)
-    df["trades"] = df["trades"].astype(int)
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    df = df.set_index("open_time").sort_index()
-    return df
-
-# -------------------- FEATURES --------------------
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / (avg_loss + 1e-12)
-    return 100 - (100/(1+rs))
-
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-def macd(series: pd.Series, fast=12, slow=26, signal=9):
-    macd_line = ema(series, fast) - ema(series, slow)
-    signal_line = ema(macd_line, signal)
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
-def build_tf_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
-    """
-    Expects df indexed by open_time with columns close, high, low, volume, etc.
-    Returns a feature dataframe with engineered columns prefixed.
-    """
-    out = pd.DataFrame(index=df.index)
-    close = df["close"]
-    out[f"{prefix}_ret1"] = close.pct_change()
-    out[f"{prefix}_ret5"] = close.pct_change(5)
-    out[f"{prefix}_vol"] = df["volume"].rolling(20).mean()
-    out[f"{prefix}_rng"] = (df["high"]-df["low"]) / (df["open"]+1e-12)
-    out[f"{prefix}_rsi14"] = rsi(close, 14)
-    m, s, h = macd(close)
-    out[f"{prefix}_macd"] = m
-    out[f"{prefix}_macd_sig"] = s
-    out[f"{prefix}_macd_hist"] = h
-    out[f"{prefix}_ema20"] = ema(close, 20)
-    out[f"{prefix}_ema50"] = ema(close, 50)
-    out[f"{prefix}_ema200"] = ema(close, 200)
-    return out
-
-def merge_asof_multi(base: pd.DataFrame, others: dict) -> pd.DataFrame:
-    """
-    others: dict of name->feature_df (indexed by open_time)
-    Performs asof merge to align other TF features onto base index.
-    """
-    merged = base.copy()
-    merged = merged.sort_index().reset_index().rename(columns={"open_time":"ts"}) if "open_time" in merged.columns else merged.sort_index().reset_index().rename(columns={merged.index.name or "index":"ts"})
-    for name, feat in others.items():
-        f = feat.sort_index().reset_index().rename(columns={"open_time":"ts"})
-        merged = pd.merge_asof(merged.sort_values("ts"), f.sort_values("ts"), on="ts", direction="backward")
-    merged = merged.set_index("ts").sort_index()
-    return merged
-
-# -------------------- LABELS --------------------
-
-def make_labels(base_candles: pd.DataFrame, horizon_bars: int = 1) -> pd.Series:
-    future_close = base_candles["close"].shift(-horizon_bars)
-    y = (future_close > base_candles["close"]).astype(int)
-    return y
-
-# -------------------- MODEL --------------------
-
-class MLP(nn.Module):
-    def __init__(self, in_features: int, hidden: int = 128, dropout: float = 0.2):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_features, hidden),
+class TradingModel(nn.Module):
+    """PyTorch neural network for trading signal prediction."""
+    
+    def __init__(self, input_size, hidden_size=128, dropout=0.2):
+        super(TradingModel, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, 1),
-            nn.Sigmoid()
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, 2)  # Buy (1) or No-Trade (0)
         )
+    
     def forward(self, x):
-        return self.net(x)
+        return self.network(x)
 
-# -------------------- BACKTEST --------------------
+class FeatureEngineer:
+    """Feature engineering for multi-timeframe analysis."""
+    
+    def __init__(self):
+        self.scalers = {}
+    
+    def add_technical_indicators(self, df):
+        """Add technical indicators to the dataframe."""
+        # Price-based indicators
+        df['sma_5'] = df['close'].rolling(window=5).mean()
+        df['sma_10'] = df['close'].rolling(window=10).mean()
+        df['sma_20'] = df['close'].rolling(window=20).mean()
+        df['ema_5'] = df['close'].ewm(span=5).mean()
+        df['ema_10'] = df['close'].ewm(span=10).mean()
+        df['ema_20'] = df['close'].ewm(span=20).mean()
+        
+        # RSI
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        # MACD
+        ema_12 = df['close'].ewm(span=12).mean()
+        ema_26 = df['close'].ewm(span=26).mean()
+        df['macd'] = ema_12 - ema_26
+        df['macd_signal'] = df['macd'].ewm(span=9).mean()
+        df['macd_histogram'] = df['macd'] - df['macd_signal']
+        
+        # Bollinger Bands
+        df['bb_middle'] = df['close'].rolling(window=20).mean()
+        bb_std = df['close'].rolling(window=20).std()
+        df['bb_upper'] = df['bb_middle'] + (bb_std * 2)
+        df['bb_lower'] = df['bb_middle'] - (bb_std * 2)
+        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
+        df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+        
+        # Volume indicators
+        df['volume_sma'] = df['volume'].rolling(window=20).mean()
+        df['volume_ratio'] = df['volume'] / df['volume_sma']
+        
+        # Price momentum
+        df['price_change_1'] = df['close'].pct_change(1)
+        df['price_change_3'] = df['close'].pct_change(3)
+        df['price_change_5'] = df['close'].pct_change(5)
+        
+        # Volatility
+        df['volatility'] = df['close'].rolling(window=20).std()
+        
+        # High-Low spread
+        df['hl_spread'] = (df['high'] - df['low']) / df['close']
+        
+        return df
+    
+    def create_multi_timeframe_features(self, df_1h, df_4h, df_1d):
+        """Create features using multiple timeframes."""
+        # Align timeframes
+        df_1h['datetime'] = pd.to_datetime(df_1h['open_time'])
+        df_4h['datetime'] = pd.to_datetime(df_4h['open_time'])
+        df_1d['datetime'] = pd.to_datetime(df_1d['open_time'])
+        
+        # Add technical indicators to each timeframe
+        df_1h = self.add_technical_indicators(df_1h)
+        df_4h = self.add_technical_indicators(df_4h)
+        df_1d = self.add_technical_indicators(df_1d)
+        
+        # Create 4h trend features
+        df_4h['4h_trend'] = np.where(df_4h['close'] > df_4h['sma_20'], 1, 0)
+        df_4h['4h_momentum'] = df_4h['close'].pct_change(1)
+        
+        # Create 1d trend features
+        df_1d['1d_trend'] = np.where(df_1d['close'] > df_1d['sma_20'], 1, 0)
+        df_1d['1d_momentum'] = df_1d['close'].pct_change(1)
+        
+        # Merge timeframes
+        df_1h['hour'] = df_1h['datetime'].dt.hour
+        df_1h['day_of_week'] = df_1h['datetime'].dt.dayofweek
+        
+        # Forward fill 4h and 1d data to align with 1h
+        df_4h_aligned = df_4h.set_index('datetime').reindex(df_1h['datetime'], method='ffill')
+        df_1d_aligned = df_1d.set_index('datetime').reindex(df_1h['datetime'], method='ffill')
+        
+        # Add 4h features
+        for col in ['4h_trend', '4h_momentum', 'rsi', 'macd', 'bb_position']:
+            if col in df_4h_aligned.columns:
+                df_1h[f'4h_{col}'] = df_4h_aligned[col].values
+        
+        # Add 1d features
+        for col in ['1d_trend', '1d_momentum', 'rsi', 'macd', 'bb_position']:
+            if col in df_1d_aligned.columns:
+                df_1h[f'1d_{col}'] = df_1d_aligned[col].values
+        
+        return df_1h
+    
+    def create_labels(self, df, min_gain_pct=3.0):
+        """Create labels for buy/no-trade signals with minimum gain requirement."""
+        # Calculate next bar's return
+        df['next_return'] = df['close'].shift(-1) / df['open'].shift(-1) - 1
+        
+        # Create labels: 1 for buy (if gain >= min_gain_pct), 0 for no-trade
+        df['label'] = np.where(df['next_return'] >= min_gain_pct / 100, 1, 0)
+        
+        return df
 
-def backtest_long_only(pred_proba: pd.Series, base_candles: pd.DataFrame, threshold: float = 0.55, hold_bars: int = 1, fee_bps: float = 10.0):
-    """
-    Very simple: enter long at open of next bar when prob>threshold, hold for N bars, exit at close, apply fees.
-    """
-    df = pd.DataFrame(index=pred_proba.index)
-    df["prob"] = pred_proba
-    df["close"] = base_candles.loc[df.index, "close"]
-    df["next_open"] = base_candles["open"].shift(-1).reindex(df.index)
-    df["future_close"] = base_candles["close"].shift(-hold_bars).shift(-(1)).reindex(df.index)  # close after hold bars
-    fee = fee_bps / 10_000.0
-    df["enter"] = (df["prob"] > threshold).astype(int)
-    # Compute trade returns
-    # If enter, buy at next_open, sell at future_close.
-    trade_ret = np.where(df["enter"]==1,
-                         ((df["future_close"] / df["next_open"]) - 1.0) - 2*fee,
-                         0.0)
-    df["trade_ret"] = trade_ret
-    df["equity"] = (1.0 + df["trade_ret"].fillna(0)).cumprod()
-    # Metrics
-    total_return = df["equity"].iloc[-1] - 1.0 if len(df) else 0.0
-    rets = df["trade_ret"].replace(0, np.nan).dropna()
-    if len(rets) > 1:
-        sharpe = np.sqrt(252*24*4) * (rets.mean() / (rets.std()+1e-12))  # rough: 15m bars ~ 4/h
-    else:
-        sharpe = np.nan
-    # Max drawdown
-    roll_max = df["equity"].cummax()
-    drawdown = (df["equity"]/roll_max - 1.0)
-    max_dd = drawdown.min() if len(drawdown) else 0.0
-    return {
-        "total_return": float(total_return),
-        "sharpe": float(sharpe) if not math.isnan(sharpe) else None,
-        "max_drawdown": float(max_dd),
-        "trades": int(df["enter"].sum())
-    }, df
+class DataProcessor:
+    """Data processing and preparation for training."""
+    
+    def __init__(self, config):
+        self.config = config
+        self.feature_engineer = FeatureEngineer()
+    
+    def load_data(self):
+        """Load and process data from CSV files."""
+        symbol = self.config['symbol']
+        data_dir = self.config['storage']['data_dir']
+        
+        # Load data for different timeframes
+        df_1h = pd.read_csv(f"{data_dir}/{symbol}_1h.csv")
+        df_4h = pd.read_csv(f"{data_dir}/{symbol}_4h.csv")
+        df_1d = pd.read_csv(f"{data_dir}/{symbol}_1d.csv")
+        
+        print(f"Loaded data: {len(df_1h)} 1h bars, {len(df_4h)} 4h bars, {len(df_1d)} 1d bars")
+        
+        # Create multi-timeframe features
+        df_combined = self.feature_engineer.create_multi_timeframe_features(df_1h, df_4h, df_1d)
+        
+        # Create labels
+        df_combined = self.feature_engineer.create_labels(df_combined, min_gain_pct=3.0)
+        
+        return df_combined
+    
+    def prepare_features(self, df):
+        """Prepare features for training."""
+        # Select feature columns
+        feature_cols = [
+            'open', 'high', 'low', 'close', 'volume',
+            'sma_5', 'sma_10', 'sma_20', 'ema_5', 'ema_10', 'ema_20',
+            'rsi', 'macd', 'macd_signal', 'macd_histogram',
+            'bb_width', 'bb_position', 'volume_ratio',
+            'price_change_1', 'price_change_3', 'price_change_5',
+            'volatility', 'hl_spread', 'hour', 'day_of_week',
+            '4h_4h_trend', '4h_4h_momentum', '4h_rsi', '4h_macd', '4h_bb_position',
+            '1d_1d_trend', '1d_1d_momentum', '1d_rsi', '1d_macd', '1d_bb_position'
+        ]
+        
+        # Filter available columns
+        available_cols = [col for col in feature_cols if col in df.columns]
+        X = df[available_cols].fillna(0)
+        y = df['label'].fillna(0)
+        
+        # Remove rows with NaN values
+        valid_idx = ~(X.isna().any(axis=1) | y.isna())
+        X = X[valid_idx]
+        y = y[valid_idx]
+        
+        print(f"Features shape: {X.shape}, Labels shape: {y.shape}")
+        print(f"Buy signals: {y.sum()}, No-trade signals: {(y == 0).sum()}")
+        
+        return X, y
 
-# -------------------- LIVE --------------------
+class ModelTrainer:
+    """Model training and evaluation."""
+    
+    def __init__(self, config):
+        self.config = config
+        self.model = None
+        self.scaler = StandardScaler()
+    
+    def train(self, X, y):
+        """Train the model."""
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=self.config['train']['test_size'],
+            random_state=self.config['train']['random_state'], stratify=y
+        )
+        
+        # Scale features
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+        
+        # Convert to tensors
+        X_train_tensor = torch.FloatTensor(X_train_scaled)
+        y_train_tensor = torch.LongTensor(y_train.values)
+        X_test_tensor = torch.FloatTensor(X_test_scaled)
+        y_test_tensor = torch.LongTensor(y_test.values)
+        
+        # Create data loaders
+        train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+        train_loader = DataLoader(train_dataset, batch_size=self.config['train']['batch_size'], shuffle=True)
+        
+        # Initialize model
+        self.model = TradingModel(
+            input_size=X_train_scaled.shape[1],
+            hidden_size=self.config['train']['hidden_size'],
+            dropout=self.config['train']['dropout']
+        )
+        
+        # Training setup
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=self.config['train']['lr'])
+        
+        # Training loop
+        self.model.train()
+        for epoch in range(self.config['train']['epochs']):
+            total_loss = 0
+            correct = 0
+            total = 0
+            
+            for batch_X, batch_y in train_loader:
+                optimizer.zero_grad()
+                outputs = self.model(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+                _, predicted = torch.max(outputs.data, 1)
+                total += batch_y.size(0)
+                correct += (predicted == batch_y).sum().item()
+            
+            if (epoch + 1) % 5 == 0:
+                accuracy = 100 * correct / total
+                print(f'Epoch [{epoch+1}/{self.config["train"]["epochs"]}], Loss: {total_loss/len(train_loader):.4f}, Accuracy: {accuracy:.2f}%')
+        
+        # Evaluate on test set
+        self.model.eval()
+        with torch.no_grad():
+            test_outputs = self.model(X_test_tensor)
+            _, test_predicted = torch.max(test_outputs, 1)
+            test_accuracy = (test_predicted == y_test_tensor).sum().item() / len(y_test_tensor)
+            print(f'Test Accuracy: {test_accuracy:.4f}')
+            
+            # Classification report
+            print("\nClassification Report:")
+            print(classification_report(y_test_tensor, test_predicted, target_names=['No-Trade', 'Buy']))
+        
+        return X_test, y_test, test_predicted
+    
+    def save_model(self, artifacts_dir):
+        """Save the trained model and scaler."""
+        os.makedirs(artifacts_dir, exist_ok=True)
+        
+        # Save model
+        torch.save(self.model.state_dict(), f"{artifacts_dir}/trading_model.pth")
+        
+        # Save scaler
+        import joblib
+        joblib.dump(self.scaler, f"{artifacts_dir}/scaler.pkl")
+        
+        print(f"Model saved to {artifacts_dir}/")
 
-def place_market_buy(client: SpotClient, symbol: str, quote_qty: float):
-    return client.new_order(symbol=symbol, side="BUY", type="MARKET", quoteOrderQty=round(quote_qty,2))
-
-def place_market_sell(client: SpotClient, symbol: str, base_qty: float):
-    return client.new_order(symbol=symbol, side="SELL", type="MARKET", quantity=base_qty)
-
-# -------------------- MAIN PIPELINE --------------------
-
-def run_pipeline(config: dict):
-    os.makedirs(config["storage"]["data_dir"], exist_ok=True)
-    os.makedirs(config["storage"]["artifacts_dir"], exist_ok=True)
-
-    # API keys
-    env = load_env_file()
-    api_key = env.get("BINANCE_API_KEY", os.environ.get("BINANCE_API_KEY", ""))
-    api_secret = env.get("BINANCE_API_SECRET", os.environ.get("BINANCE_API_SECRET", ""))
-    use_testnet = env.get("USE_TESTNET", str(config.get("use_testnet", True))).lower() == "true"
-
-    if not api_key or not api_secret:
-        print("[WARN] No API keys found in .env or environment. You can still download public klines, but live trading will be disabled.")
-
-    client = make_client(api_key, api_secret, use_testnet=use_testnet)
-
-    # Time window
-    end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=365*config["lookback_years"])
-
-    print(f"Fetching klines for {config['symbol']} from {start_dt} to {end_dt}...")
-
-    # Download TF data
-    tf_data = {}
-    for tf in config["timeframes"]:
-        print(f"  -> {tf}")
-        df = fetch_klines(client, config["symbol"], tf, int(start_dt.timestamp()*1000), int(end_dt.timestamp()*1000))
-        if len(df) < config["min_rows_per_tf"]:
-            raise RuntimeError(f"Not enough data for {tf}, got {len(df)} rows")
-        # Save raw
-        df.to_csv(os.path.join(config["storage"]["data_dir"], f"{config['symbol']}_{tf}.csv"))
-        tf_data[tf] = df
-
-    # Build features per TF
-    feats = {}
-    for tf, df in tf_data.items():
-        feats[tf] = build_tf_features(df, prefix=tf)
-
-    # Define base TF candles
-    base_tf = config["base_timeframe"]
-    base_candles = tf_data[base_tf][["open","high","low","close","volume"]].copy()
-
-    # Merge all features as-of onto base index
-    others = {tf: feat for tf, feat in feats.items() if tf != base_tf}
-    X_all = merge_asof_multi(feats[base_tf], others)
-
-    # Drop rows with NaNs at the start
-    X_all = X_all.dropna().copy()
-    base_candles = base_candles.reindex(X_all.index).dropna()
-
-    # Labels
-    y = make_labels(base_candles, horizon_bars=config["label_horizon_bars"]).reindex(X_all.index).dropna()
-    X_all = X_all.reindex(y.index).copy()
-
-    # Train/val split
-    X_train, X_val, y_train, y_val = train_test_split(X_all.values, y.values, test_size=config["train"]["test_size"], shuffle=False)
-
-    scaler = StandardScaler()
-    X_train_sc = scaler.fit_transform(X_train)
-    X_val_sc = scaler.transform(X_val)
-
-    # Torch tensors
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MLP(in_features=X_train_sc.shape[1], hidden=config["train"]["hidden_size"], dropout=config["train"]["dropout"]).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=config["train"]["lr"])
-    loss_fn = nn.BCELoss()
-
-    train_ds = TensorDataset(torch.tensor(X_train_sc, dtype=torch.float32), torch.tensor(y_train.reshape(-1,1), dtype=torch.float32))
-    val_ds = TensorDataset(torch.tensor(X_val_sc, dtype=torch.float32), torch.tensor(y_val.reshape(-1,1), dtype=torch.float32))
-
-    train_loader = DataLoader(train_ds, batch_size=config["train"]["batch_size"], shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=config["train"]["batch_size"], shuffle=False)
-
-    best_val = 1e9
-    best_state = None
-    for epoch in range(1, config["train"]["epochs"]+1):
-        model.train()
-        tr_loss = 0.0
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            opt.zero_grad()
-            pred = model(xb)
-            loss = loss_fn(pred, yb)
-            loss.backward()
-            opt.step()
-            tr_loss += loss.item()*len(xb)
-        tr_loss /= len(train_loader.dataset)
-
+class Backtester:
+    """Backtesting engine for strategy validation."""
+    
+    def __init__(self, config):
+        self.config = config
+    
+    def backtest(self, df, model, scaler, threshold=0.5):
+        """Run backtest on the strategy."""
+        # Prepare features
+        feature_cols = [
+            'open', 'high', 'low', 'close', 'volume',
+            'sma_5', 'sma_10', 'sma_20', 'ema_5', 'ema_10', 'ema_20',
+            'rsi', 'macd', 'macd_signal', 'macd_histogram',
+            'bb_width', 'bb_position', 'volume_ratio',
+            'price_change_1', 'price_change_3', 'price_change_5',
+            'volatility', 'hl_spread', 'hour', 'day_of_week',
+            '4h_4h_trend', '4h_4h_momentum', '4h_rsi', '4h_macd', '4h_bb_position',
+            '1d_1d_trend', '1d_1d_momentum', '1d_rsi', '1d_macd', '1d_bb_position'
+        ]
+        
+        available_cols = [col for col in feature_cols if col in df.columns]
+        X = df[available_cols].fillna(0)
+        
+        # Scale features
+        X_scaled = scaler.transform(X)
+        X_tensor = torch.FloatTensor(X_scaled)
+        
+        # Get predictions
         model.eval()
         with torch.no_grad():
-            va_loss = 0.0
-            all_p, all_y = [], []
-            for xb, yb in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                pr = model(xb)
-                loss = loss_fn(pr, yb)
-                va_loss += loss.item()*len(xb)
-                all_p.append(pr.cpu().numpy())
-                all_y.append(yb.cpu().numpy())
-            va_loss /= len(val_loader.dataset)
-            all_p = np.vstack(all_p).ravel()
-            all_y = np.vstack(all_y).ravel()
-            auc = roc_auc_score(all_y, all_p) if len(np.unique(all_y))==2 else float("nan")
-        print(f"Epoch {epoch:02d} | train {tr_loss:.4f} | val {va_loss:.4f} | AUC {auc:.4f}")
-        if va_loss < best_val:
-            best_val = va_loss
-            best_state = model.state_dict()
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    # Save artifacts
-    artifacts_dir = config["storage"]["artifacts_dir"]
-    os.makedirs(artifacts_dir, exist_ok=True)
-    model_path = os.path.join(artifacts_dir, "model.pt")
-    torch.save(model.state_dict(), model_path)
-    scaler_path = os.path.join(artifacts_dir, "scaler.pkl")
-    joblib.dump(scaler, scaler_path)
-    features_path = os.path.join(artifacts_dir, "feature_columns.json")
-    joblib.dump(X_all.columns.tolist(), features_path)
-    print(f"Saved model to {model_path}")
-    print(f"Saved scaler to {scaler_path}")
-
-    # Backtest on validation fold (time-ordered split)
-    # Recompute probabilities on entire X_all to align indices
-    X_all_sc = scaler.transform(X_all.values)
-    with torch.no_grad():
-        proba_all = model(torch.tensor(X_all_sc, dtype=torch.float32, device=device)).cpu().numpy().ravel()
-    proba_series = pd.Series(proba_all, index=X_all.index, name="proba")
-    # Use last 20% for backtest
-    split_idx = int(len(proba_series)*(1-config["train"]["test_size"]))
-    proba_bt = proba_series.iloc[split_idx:]
-    base_bt = base_candles.reindex(proba_bt.index)
-    stats, curve = backtest_long_only(
-        pred_proba=proba_bt,
-        base_candles=base_bt,
-        threshold=config["backtest"]["threshold"],
-        hold_bars=config["backtest"]["hold_bars"],
-        fee_bps=config["backtest"]["fee_bps"]
-    )
-    stats_path = os.path.join(artifacts_dir, "backtest_stats.json")
-    curve_path = os.path.join(artifacts_dir, "backtest_curve.csv")
-    with open(stats_path,"w") as f:
-        json.dump(stats, f, indent=2)
-    curve.to_csv(curve_path)
-    print("Backtest:", stats)
-
-    return {
-        "model_path": model_path,
-        "scaler_path": scaler_path,
-        "features_path": features_path,
-        "backtest_stats_path": stats_path,
-        "backtest_curve_path": curve_path
-    }
-
-# -------------------- LIVE LOOP --------------------
-
-def latest_features_and_signal(client: SpotClient, config: dict, scaler: StandardScaler, model: nn.Module):
-    """
-    Pulls the latest candles for each timeframe (about 400 bars per tf),
-    rebuilds features, aligns, returns current proba signal on the latest base bar.
-    """
-    symbol = config["symbol"]
-    base_tf = config["base_timeframe"]
-    end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=14)  # minimal window for indicators
-
-    tf_data = {}
-    for tf in config["timeframes"]:
-        df = fetch_klines(client, symbol, tf, int(start_dt.timestamp()*1000), int(end_dt.timestamp()*1000))
-        tf_data[tf] = df
-
-    feats = {tf: build_tf_features(df, prefix=tf) for tf, df in tf_data.items()}
-    base_candles = tf_data[base_tf][["open","high","low","close","volume"]]
-    others = {tf: feat for tf, feat in feats.items() if tf != base_tf}
-    X_now = merge_asof_multi(feats[base_tf], others).dropna()
-    if X_now.empty:
-        return None, None, None
-    cols = X_now.columns.tolist()
-    X_sc = scaler.transform(X_now.values)
-    device = next(model.parameters()).device
-    with torch.no_grad():
-        proba = model(torch.tensor(X_sc, dtype=torch.float32, device=device)).cpu().numpy().ravel()
-    proba_series = pd.Series(proba, index=X_now.index, name="proba")
-    last_ts = proba_series.index[-1]
-    last_proba = float(proba_series.iloc[-1])
-    last_price = float(base_candles.loc[last_ts, "close"])
-    return last_ts, last_proba, last_price
-
-def run_live_loop(config: dict):
-    env = load_env_file()
-    api_key = env.get("BINANCE_API_KEY", os.environ.get("BINANCE_API_KEY", ""))
-    api_secret = env.get("BINANCE_API_SECRET", os.environ.get("BINANCE_API_SECRET", ""))
-    use_testnet = env.get("USE_TESTNET", str(config.get("use_testnet", True))).lower() == "true"
-    dry_run = env.get("DRY_RUN", str(config["live"]["dry_run"])).lower() == "true"
-    trade_quote_size = float(env.get("TRADE_QUOTE_SIZE", config["live"]["trade_quote_size"]))
-
-    client = make_client(api_key, api_secret, use_testnet=use_testnet)
-
-    # Load artifacts
-    artifacts_dir = config["storage"]["artifacts_dir"]
-    model_path = os.path.join(artifacts_dir, "model.pt")
-    scaler_path = os.path.join(artifacts_dir, "scaler.pkl")
-
-    if not (os.path.exists(model_path) and os.path.exists(scaler_path)):
-        print("[ERROR] Train the model first to create artifacts.")
-        return
-
-    scaler = joblib.load(scaler_path)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # re-create model with correct input size
-    sample_cols = joblib.load(os.path.join(artifacts_dir, "feature_columns.json"))
-    model = MLP(in_features=len(sample_cols))
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model = model.to(device).eval()
-
-    print("Starting live loop. Press Ctrl+C to stop.")
-    position_file = os.path.join(artifacts_dir, "position_state.json")
-    # Simple position state
-    if os.path.exists(position_file):
-        with open(position_file,"r") as f:
-            state = json.load(f)
-    else:
-        state = {"has_position": False, "base_qty": 0.0}
-
-    threshold = config["backtest"]["threshold"]
-
-    try:
-        while True:
-            ts, proba, price = latest_features_and_signal(client, config, scaler, model)
-            if ts is None:
-                print("Waiting for enough data...")
-                time.sleep(config["live"]["poll_seconds"])
-                continue
-            print(f"[{ts}] proba_up={proba:.3f} price={price:.2f}")
-            if (proba is not None) and (proba > threshold) and not state["has_position"]:
-                # Enter long
-                if dry_run:
-                    print(f"DRY_RUN: would BUY ~{trade_quote_size} USDC of {config['symbol']}")
-                    state["has_position"] = True
-                    state["base_qty"] = (trade_quote_size / price) * 0.999  # fee slippage estimate
-                else:
-                    try:
-                        order = place_market_buy(client, config["symbol"], trade_quote_size)
-                        fills_qty = sum(float(f["qty"]) for f in order.get("fills", [])) if "fills" in order else 0.0
-                        state["has_position"] = True
-                        state["base_qty"] = fills_qty if fills_qty>0 else (trade_quote_size/price)
-                        print("BUY order executed:", order)
-                    except ClientError as e:
-                        print("BUY error:", e)
-            elif state["has_position"]:
-                # Naive exit: after one base bar, just sell on next loop iteration
-                if dry_run:
-                    print(f"DRY_RUN: would SELL {state['base_qty']:.6f} {config['symbol'][:-4]}")
-                    state["has_position"] = False
-                    state["base_qty"] = 0.0
-                else:
-                    try:
-                        order = place_market_sell(client, config["symbol"], state["base_qty"])
-                        state["has_position"] = False
-                        state["base_qty"] = 0.0
-                        print("SELL order executed:", order)
-                    except ClientError as e:
-                        print("SELL error:", e)
-
-            with open(position_file,"w") as f:
-                json.dump(state, f)
-
-            time.sleep(config["live"]["poll_seconds"])
-    except KeyboardInterrupt:
-        print("Stopped.")
-
-# -------------------- CLI --------------------
+            outputs = model(X_tensor)
+            probabilities = torch.softmax(outputs, dim=1)
+            buy_prob = probabilities[:, 1].numpy()
+        
+        # Generate signals
+        signals = np.where(buy_prob >= threshold, 1, 0)
+        
+        # Calculate returns
+        df['signal'] = signals
+        df['return'] = df['close'].shift(-1) / df['open'].shift(-1) - 1
+        df['strategy_return'] = df['signal'] * df['return']
+        
+        # Calculate metrics
+        total_trades = signals.sum()
+        winning_trades = (df['strategy_return'] > 0).sum()
+        win_rate = winning_trades / total_trades if total_trades > 0 else 0
+        
+        total_return = df['strategy_return'].sum()
+        avg_return_per_trade = df['strategy_return'].mean()
+        
+        print(f"\nBacktest Results:")
+        print(f"Total trades: {total_trades}")
+        print(f"Winning trades: {winning_trades}")
+        print(f"Win rate: {win_rate:.2%}")
+        print(f"Total return: {total_return:.2%}")
+        print(f"Average return per trade: {avg_return_per_trade:.2%}")
+        
+        return df
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="AI Crypto Trading Pipeline")
-    parser.add_argument("--config", type=str, default=None, help="Path to YAML config (optional)")
-    parser.add_argument("--train", action="store_true", help="Run data download + train + backtest")
-    parser.add_argument("--live", action="store_true", help="Run live loop (loads artifacts)")
+    """Main entry point."""
+    parser = argparse.ArgumentParser(description='AiETHTrader - AI Crypto Trading Bot')
+    parser.add_argument('--config', default='config.yaml', help='Configuration file')
+    parser.add_argument('--train', action='store_true', help='Train the model')
+    parser.add_argument('--live', action='store_true', help='Run live trading')
+    
     args = parser.parse_args()
-
-    config = DEFAULT_CONFIG.copy()
-    if args.config:
-        with open(args.config, "r") as f:
-            user_conf = yaml.safe_load(f)
-        # deep update
-        def deep_update(d,u):
-            for k,v in u.items():
-                if isinstance(v, dict) and isinstance(d.get(k), dict):
-                    deep_update(d[k], v)
-                else:
-                    d[k]=v
-        deep_update(config, user_conf)
-
+    
+    # Load configuration
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    print("AiETHTrader - AI Crypto Trading Bot")
+    print("=" * 50)
+    
     if args.train:
-        paths = run_pipeline(config)
-        print("Artifacts:")
-        for k,v in paths.items():
-            print(f" - {k}: {v}")
-
-    if args.live:
-        run_live_loop(config)
-
-    if not args.train and not args.live:
-        parser.print_help()
+        print("Starting model training...")
+        
+        # Initialize components
+        data_processor = DataProcessor(config)
+        trainer = ModelTrainer(config)
+        backtester = Backtester(config)
+        
+        # Load and process data
+        df = data_processor.load_data()
+        X, y = data_processor.prepare_features(df)
+        
+        # Train model
+        X_test, y_test, predictions = trainer.train(X, y)
+        
+        # Save model
+        trainer.save_model(config['storage']['artifacts_dir'])
+        
+        # Run backtest
+        backtest_df = backtester.backtest(df, trainer.model, trainer.scaler, 
+                                        threshold=config['backtest']['threshold'])
+        
+        print("Training completed!")
+    
+    elif args.live:
+        print("Live trading not implemented yet.")
+        print("Please train the model first with --train")
+    
+    else:
+        print("Please specify --train or --live")
 
 if __name__ == "__main__":
     main()

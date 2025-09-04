@@ -1,0 +1,36 @@
+# 1-Hour Trading Model Configuration
+# Optimized for 1h bars with 4h/1d trend analysis
+# Buy signals only with 3% minimum gain requirement
+
+symbol: "ETHUSDC"
+timeframes: ["1h", "4h", "1d"]  # Focus on 1h with 4h/1d trends
+base_timeframe: "1h"            # Primary trading timeframe
+lookback_years: 2               # 2 years of historical data
+label_horizon_bars: 1           # Predict next 1h bar
+
+train:
+  test_size: 0.2                # 20% for testing
+  random_state: 42              # Reproducible results
+  epochs: 50                    # More epochs for better learning
+  batch_size: 256               # Smaller batch size for stability
+  lr: 0.0005                    # Lower learning rate for stability
+  hidden_size: 256              # Larger network for complex patterns
+  dropout: 0.3                  # Higher dropout for regularization
+
+backtest:
+  fee_bps: 10                   # 0.10% trading fee
+  threshold: 0.7                # 70% probability threshold for buy signals
+  hold_bars: 1                  # Hold for exactly 1 bar (1 hour)
+  min_gain_pct: 3.0             # Minimum 3% gain requirement
+
+live:
+  enabled: false                # Disabled by default
+  poll_seconds: 3600            # Check every hour (3600 seconds)
+  dry_run: true                 # Start with dry run
+  trade_quote_size: 100.0       # 100 USDC per trade
+
+storage:
+  data_dir: "./data"
+  artifacts_dir: "./artifacts"
+
+use_testnet: true               # Use testnet for safety

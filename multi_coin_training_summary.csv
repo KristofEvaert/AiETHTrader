@@ -1,0 +1,6 @@
+Coin,Test Accuracy,Buy Signals,Total Bars,Buy Signal Rate,Model Status
+ADAUSDC,98.5%,101,8760,1.15%,Trained
+BTCUSDC,99.9%,6,8760,0.07%,Trained
+DOGEUSDC,98.1%,110,8760,1.26%,Trained
+ETHUSDC,99.5%,23,8760,0.26%,Trained
+XRPUSDC,98.5%,100,8760,1.14%,Trained
