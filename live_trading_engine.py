@@ -58,6 +58,7 @@ class LiveTradingEngine:
         self.threshold = config['backtest']['threshold']
         self.dry_run = config['live']['dry_run']
         self.poll_seconds = config['live']['poll_seconds']
+        self.stop_loss_pct = config['live']['risk_management'].get('stop_loss_pct', 2.0)
         self.signal_check_interval = config['live'].get('signal_check_interval', 3600)  # Check signals every hour
         self.use_full_bankroll = config['live'].get('use_full_bankroll', True)  # Use entire bankroll
         self.fee_bps = config['backtest']['fee_bps']  # Trading fee in basis points (0.10% = 10 bps)
@@ -149,7 +150,7 @@ class LiveTradingEngine:
             # Get real USDC balance from exchange
             try:
                 from binance.client import Client
-                client = Client(self.api_key, self.api_secret, testnet=self.config.get('use_testnet', True))
+                client = Client(self.api_key, self.api_secret, testnet=self.config.get('exchange', {}).get('use_testnet', True))
                 account = client.get_account()
                 
                 # Find USDC balance
@@ -275,6 +276,43 @@ class LiveTradingEngine:
         
         return X
     
+    def get_actual_coin_balance(self, coin: str) -> float:
+        """
+        Get actual coin balance from exchange.
+        
+        Args:
+            coin: Coin symbol (e.g., 'ETHUSDC')
+            
+        Returns:
+            Actual balance of the base coin (e.g., ETH amount)
+        """
+        if self.dry_run:
+            # In dry run, return the stored amount
+            if coin in self.current_positions:
+                return self.current_positions[coin]['coin_amount']
+            return 0.0
+        
+        try:
+            from binance.client import Client
+            client = Client(self.api_key, self.api_secret, testnet=self.config.get('exchange', {}).get('use_testnet', True))
+            
+            # Get account info
+            account = client.get_account()
+            
+            # Extract base coin from symbol (e.g., 'ETHUSDC' -> 'ETH')
+            base_coin = coin.replace('USDC', '')
+            
+            # Find the balance
+            for balance in account['balances']:
+                if balance['asset'] == base_coin:
+                    return float(balance['free'])
+            
+            return 0.0
+            
+        except Exception as e:
+            self.logger.error(f"Error getting {coin} balance: {e}")
+            return 0.0
+
     def get_current_price(self, coin: str) -> float:
         """
         Get current price for a coin.
@@ -306,7 +344,7 @@ class LiveTradingEngine:
             # Real API call to get current price
             try:
                 from binance.client import Client
-                client = Client(self.api_key, self.api_secret, testnet=self.config.get('use_testnet', True))
+                client = Client(self.api_key, self.api_secret, testnet=self.config.get('exchange', {}).get('use_testnet', True))
                 ticker = client.get_symbol_ticker(symbol=coin)
                 return float(ticker['price'])
             except Exception as e:
@@ -474,26 +512,22 @@ class LiveTradingEngine:
                         self.logger.error("Insufficient USDC balance for trade")
                         return False, 0, 0
                     
-                    # Calculate amount to buy (accounting for fees)
-                    fee_rate = self.fee_bps / 10000
-                    usdc_after_fee = usdc_balance / (1 + fee_rate)
-                    coin_amount = usdc_after_fee / price
-                    fee = usdc_balance - usdc_after_fee
-                    
                     # Execute market buy order
                     order = client.order_market_buy(
                         symbol=coin,
                         quoteOrderQty=usdc_balance  # Buy with all available USDC
                     )
                     
-                    self.logger.info(f"[LIVE] BUY {coin_amount:.6f} {coin} for {usdc_balance:.2f} USDC (fee: {fee:.2f} USDC) at ${price:.2f}")
-                    return True, coin_amount, fee
+                    # Get actual amount of coin received (after fees)
+                    actual_coin_amount = float(order['executedQty'])
+                    actual_usdc_spent = float(order['cummulativeQuoteQty'])
+                    actual_fee = usdc_balance - actual_usdc_spent
+                    
+                    self.logger.info(f"[LIVE] BUY {actual_coin_amount:.6f} {coin} for {actual_usdc_spent:.2f} USDC (fee: {actual_fee:.2f} USDC) at ${price:.2f}")
+                    return True, actual_coin_amount, actual_fee
                 else:
                     # Use fixed position size
                     usdc_amount = self.position_size
-                    fee = self.calculate_fee(usdc_amount, is_buy=True)
-                    usdc_after_fee = usdc_amount - fee
-                    coin_amount = usdc_after_fee / price
                     
                     # Execute market buy order
                     order = client.order_market_buy(
@@ -501,8 +535,13 @@ class LiveTradingEngine:
                         quoteOrderQty=usdc_amount
                     )
                     
-                    self.logger.info(f"[LIVE] BUY {coin_amount:.6f} {coin} for {usdc_amount:.2f} USDC (fee: {fee:.2f} USDC) at ${price:.2f}")
-                    return True, coin_amount, fee
+                    # Get actual amount of coin received (after fees)
+                    actual_coin_amount = float(order['executedQty'])
+                    actual_usdc_spent = float(order['cummulativeQuoteQty'])
+                    actual_fee = usdc_amount - actual_usdc_spent
+                    
+                    self.logger.info(f"[LIVE] BUY {actual_coin_amount:.6f} {coin} for {actual_usdc_spent:.2f} USDC (fee: {actual_fee:.2f} USDC) at ${price:.2f}")
+                    return True, actual_coin_amount, actual_fee
                     
             elif action == 'sell':
                 # Sell the exact amount of coin we have
@@ -514,13 +553,13 @@ class LiveTradingEngine:
                     quantity=coin_amount
                 )
                 
-                # Calculate fees and proceeds
-                usdc_before_fee = coin_amount * price
-                fee = self.calculate_fee(usdc_before_fee, is_buy=False)
-                usdc_after_fee = usdc_before_fee - fee
+                # Get actual amounts from order execution
+                actual_coin_sold = float(order['executedQty'])
+                actual_usdc_received = float(order['cummulativeQuoteQty'])
+                actual_fee = (coin_amount * price) - actual_usdc_received
                 
-                self.logger.info(f"[LIVE] SELL {coin_amount:.6f} {coin} for {usdc_before_fee:.2f} USDC (fee: {fee:.2f} USDC) at ${price:.2f}")
-                return True, usdc_after_fee, fee
+                self.logger.info(f"[LIVE] SELL {actual_coin_sold:.6f} {coin} for {actual_usdc_received:.2f} USDC (fee: {actual_fee:.2f} USDC) at ${price:.2f}")
+                return True, actual_usdc_received, actual_fee
                 
         except Exception as e:
             self.logger.error(f"Error executing real trade: {e}")
@@ -630,16 +669,76 @@ class LiveTradingEngine:
         
         for coin, position in list(self.current_positions.items()):
             try:
-                # Check if position should be closed (1 hour has passed)
+                # Get current price for stop-loss check
+                current_price = self.get_current_price(coin)
+                entry_price = position['entry_price']
                 entry_time = position['entry_time']
+                
+                # Check for stop-loss (price dropped by stop_loss_pct below entry)
+                stop_loss_price = entry_price * (1 - self.stop_loss_pct / 100)
+                if current_price < stop_loss_price:
+                    self.logger.info(f"STOP-LOSS triggered for {coin}: {current_price:.2f} < {stop_loss_price:.2f} ({self.stop_loss_pct}% below entry {entry_price:.2f})")
+                    
+                    # Get actual coin balance and execute sell order
+                    actual_coin_balance = self.get_actual_coin_balance(coin)
+                    if actual_coin_balance <= 0:
+                        self.logger.error(f"No {coin} balance to sell")
+                        continue
+                    
+                    success, usdc_received, sell_fee = self.execute_trade(coin, 'sell', current_price, actual_coin_balance)
+                    if success:
+                        # Calculate PnL
+                        usdc_spent = position['usdc_spent']
+                        total_fees = position['buy_fee'] + sell_fee
+                        pnl = usdc_received - usdc_spent
+                        
+                        # Add USDC back to bankroll (after sell fees)
+                        if self.dry_run:
+                            self.bankroll = usdc_received
+                        else:
+                            # In live mode, get updated balance from exchange
+                            self.bankroll = self.get_initial_bankroll()
+                        
+                        # Record trade
+                        trade_record = {
+                            'coin': coin,
+                            'entry_time': entry_time,
+                            'exit_time': current_time,
+                            'entry_price': entry_price,
+                            'exit_price': current_price,
+                            'coin_amount': actual_coin_balance,
+                            'usdc_spent': usdc_spent,
+                            'usdc_received': usdc_received,
+                            'buy_fee': position['buy_fee'],
+                            'sell_fee': sell_fee,
+                            'total_fees': total_fees,
+                            'pnl': pnl,
+                            'pnl_percentage': (pnl / usdc_spent) * 100,
+                            'bankroll_after': self.bankroll,
+                            'signal_probability': position.get('signal_probability', 0.0),
+                            'competing_signals': position.get('competing_signals', 0),
+                            'exit_reason': 'STOP_LOSS'
+                        }
+                        self.trade_history.append(trade_record)
+                        
+                        # Remove position
+                        del self.current_positions[coin]
+                        
+                        self.logger.info(f"STOP-LOSS: Closed position in {coin}: {coin_amount:.6f} {coin} -> {usdc_received:.2f} USDC (PnL: ${pnl:.2f}, {trade_record['pnl_percentage']:.2f}%, fees: ${total_fees:.2f})")
+                        continue  # Skip the time-based exit check
+                
+                # Check if position should be closed (1 hour has passed)
                 if (current_time - entry_time).total_seconds() >= 3600:  # 1 hour
                     
-                    # Get current price (would come from exchange in live trading)
+                    # Get current price and actual coin balance
                     exit_price = self.get_current_price(coin)
-                    coin_amount = position['coin_amount']
+                    actual_coin_balance = self.get_actual_coin_balance(coin)
+                    if actual_coin_balance <= 0:
+                        self.logger.error(f"No {coin} balance to sell")
+                        continue
                     
                     # Execute sell order
-                    success, usdc_received, sell_fee = self.execute_trade(coin, 'sell', exit_price, coin_amount)
+                    success, usdc_received, sell_fee = self.execute_trade(coin, 'sell', exit_price, actual_coin_balance)
                     if success:
                         # Calculate PnL
                         entry_price = position['entry_price']
@@ -661,7 +760,7 @@ class LiveTradingEngine:
                             'exit_time': current_time,
                             'entry_price': entry_price,
                             'exit_price': exit_price,
-                            'coin_amount': coin_amount,
+                            'coin_amount': actual_coin_balance,
                             'usdc_spent': usdc_spent,
                             'usdc_received': usdc_received,
                             'buy_fee': position['buy_fee'],
@@ -671,7 +770,8 @@ class LiveTradingEngine:
                             'pnl_percentage': (pnl / usdc_spent) * 100,
                             'bankroll_after': self.bankroll,
                             'signal_probability': position.get('signal_probability', 0.0),
-                            'competing_signals': position.get('competing_signals', 0)
+                            'competing_signals': position.get('competing_signals', 0),
+                            'exit_reason': 'TIME_EXIT'
                         }
                         self.trade_history.append(trade_record)
                         

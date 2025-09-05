@@ -55,11 +55,16 @@ class MultiCoinDataManager:
         self.coins = self.get_available_coins()
         
         # Initialize Binance client
+        use_testnet = config.get('exchange', {}).get('use_testnet', True)
+        
         if api_key and api_secret:
-            self.client = Client(api_key, api_secret)
-            self.use_testnet = False
+            if use_testnet:
+                self.client = Client(api_key, api_secret, testnet=True)
+            else:
+                self.client = Client(api_key, api_secret)
+            self.use_testnet = use_testnet
         else:
-            # Use testnet for safety
+            # Use testnet for safety when no API keys provided
             self.client = Client(testnet=True)
             self.use_testnet = True
         

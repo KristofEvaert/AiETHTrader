@@ -33,7 +33,7 @@ live:
   risk_management:
     max_daily_trades: 10        # Maximum trades per day
     max_drawdown: 0.1           # 10% maximum drawdown
-    stop_loss_pct: 0.05         # 5% stop loss (if implemented)
+    stop_loss_pct: 2.0          # Stop-loss at 2% below entry price
 
 storage:
   data_dir: "./data"
@@ -52,7 +52,7 @@ data_management:
 
 # Exchange settings
 exchange:
-  use_testnet: true             # Use testnet for safety
+  use_testnet: false            # Use mainnet for live trading
   api_timeout: 30               # API timeout in seconds
   max_retries: 3                # Maximum retry attempts
 

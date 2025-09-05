@@ -11,6 +11,10 @@ import sys
 import yaml
 import argparse
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 def check_requirements():
     """Check if all requirements are met for live trading."""
@@ -143,8 +147,16 @@ def main():
     try:
         from live_trading_engine import LiveTradingEngine
         
+        # Get API credentials from environment or command line
+        api_key = args.api_key or os.getenv('BINANCE_API_KEY')
+        api_secret = args.api_secret or os.getenv('BINANCE_API_SECRET')
+        
+        if not api_key or not api_secret:
+            print("❌ API credentials not found. Please set BINANCE_API_KEY and BINANCE_API_SECRET in .env file or use --api-key and --api-secret arguments.")
+            sys.exit(1)
+        
         print("\n🔄 Starting live trading engine...")
-        engine = LiveTradingEngine(config, args.api_key, args.api_secret)
+        engine = LiveTradingEngine(config, api_key, api_secret)
         
         # Start trading
         engine.start_trading()
