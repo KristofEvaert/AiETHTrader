@@ -724,11 +724,11 @@ class LiveTradingEngine:
                         # Remove position
                         del self.current_positions[coin]
                         
-                        self.logger.info(f"STOP-LOSS: Closed position in {coin}: {coin_amount:.6f} {coin} -> {usdc_received:.2f} USDC (PnL: ${pnl:.2f}, {trade_record['pnl_percentage']:.2f}%, fees: ${total_fees:.2f})")
+                        self.logger.info(f"STOP-LOSS: Closed position in {coin}: {actual_coin_balance:.6f} {coin} -> {usdc_received:.2f} USDC (PnL: ${pnl:.2f}, {trade_record['pnl_percentage']:.2f}%, fees: ${total_fees:.2f})")
                         continue  # Skip the time-based exit check
                 
-                # Check if position should be closed (1 hour has passed)
-                if (current_time - entry_time).total_seconds() >= 3600:  # 1 hour
+                # Check if position should be closed (55 minutes have passed to ensure USDC availability for next hour)
+                if (current_time - entry_time).total_seconds() >= 3300:  # 55 minutes
                     
                     # Get current price and actual coin balance
                     exit_price = self.get_current_price(coin)
@@ -778,7 +778,7 @@ class LiveTradingEngine:
                         # Remove position
                         del self.current_positions[coin]
                         
-                        self.logger.info(f"Closed position in {coin}: {coin_amount:.6f} {coin} -> {usdc_received:.2f} USDC (PnL: ${pnl:.2f}, {trade_record['pnl_percentage']:.2f}%, fees: ${total_fees:.2f})")
+                        self.logger.info(f"Closed position in {coin}: {actual_coin_balance:.6f} {coin} -> {usdc_received:.2f} USDC (PnL: ${pnl:.2f}, {trade_record['pnl_percentage']:.2f}%, fees: ${total_fees:.2f})")
                 
             except Exception as e:
                 self.logger.error(f"Error checking exit for {coin}: {e}")
@@ -812,14 +812,14 @@ class LiveTradingEngine:
             self.logger.error("Failed to initialize data manager")
             return False
         
-        # Set initial signal check time (2 minutes after the hour to align with data updates)
+        # Set initial signal check time (3 minutes after the hour to ensure data is updated first)
         now = datetime.now()
-        self.next_signal_check = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1, minutes=2)
+        self.next_signal_check = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1, minutes=3)
         self.logger.info(f"Next signal check scheduled for: {self.next_signal_check.strftime('%H:%M:%S')}")
         
-        # Check trading signals at bar open (initial check)
-        self.logger.info("Checking trading signals at bar open...")
-        self.check_trading_signals()
+        # Wait for initial data update before checking signals
+        self.logger.info("Waiting for initial data update before checking signals...")
+        time.sleep(3)  # Wait 3 seconds for data manager to initialize
         
         self.is_running = True
         
@@ -827,13 +827,13 @@ class LiveTradingEngine:
             while self.is_running:
                 current_time = datetime.now()
                 
-                # Check if it's time for signal checking (at the top of the hour)
+                # Check if it's time for signal checking (3 minutes after the hour to ensure data is updated first)
                 if self.next_signal_check and current_time >= self.next_signal_check:
-                    self.logger.info("Checking trading signals at bar open...")
+                    self.logger.info("Checking trading signals after data update...")
                     self.check_trading_signals()
                     
-                    # Update next signal check time (2 minutes after the hour to align with data updates)
-                    self.next_signal_check = current_time.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1, minutes=2)
+                    # Update next signal check time (3 minutes after the hour to ensure data is updated first)
+                    self.next_signal_check = current_time.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1, minutes=3)
                     self.logger.info(f"Next signal check scheduled for: {self.next_signal_check.strftime('%H:%M:%S')}")
                 
                 # Always check exit signals (every minute)
