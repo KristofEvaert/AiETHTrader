@@ -66,6 +66,9 @@ class LiveTradingEngine:
         self.last_signal_check = None
         self.next_signal_check = None
         
+        # Setup logging first
+        self.setup_logging()
+        
         # Initialize components
         from multi_coin_data_manager import LiveMultiCoinDataManager
         self.data_manager = LiveMultiCoinDataManager(config, api_key, api_secret)
@@ -90,7 +93,7 @@ class LiveTradingEngine:
     def setup_logging(self):
         """Setup logging for live trading."""
         logging.basicConfig(
-            level=logging.INFO,
+            level=logging.DEBUG,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler('live_trading.log'),
@@ -330,6 +333,7 @@ class LiveTradingEngine:
         """
         try:
             if coin not in self.models:
+                self.logger.error(f"Model not found for {coin}")
                 return 0.0, False
             
             # Get data for the specific coin
@@ -338,6 +342,7 @@ class LiveTradingEngine:
             df_1d = self.data_manager.get_model_data(coin, '1d')
             
             if df_1h.empty or df_4h.empty or df_1d.empty:
+                self.logger.error(f"Empty data for {coin}: 1h={len(df_1h)}, 4h={len(df_4h)}, 1d={len(df_1d)}")
                 return 0.0, False
             
             # Create features
@@ -345,6 +350,7 @@ class LiveTradingEngine:
             X = self.prepare_features(df_combined)
             
             if X.empty:
+                self.logger.error(f"Empty features for {coin}")
                 return 0.0, False
             
             # Get latest features
@@ -364,10 +370,15 @@ class LiveTradingEngine:
             
             should_trade = buy_prob >= self.threshold
             
+            # Debug logging
+            self.logger.debug(f"{coin} prediction: raw_output={outputs[0].tolist()}, probabilities={probabilities[0].tolist()}, buy_prob={buy_prob:.6f}")
+            
             return buy_prob, should_trade
             
         except Exception as e:
             self.logger.error(f"Error getting prediction for {coin}: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
             return 0.0, False
     
     def calculate_fee(self, amount: float, is_buy: bool = True) -> float:
@@ -532,13 +543,16 @@ class LiveTradingEngine:
                     'timestamp': datetime.now()
                 }
                 
+                # Log confidence level for all coins
+                status = "BUY" if should_trade else "NO-TRADE"
+                self.logger.info(f"{coin}: {prob:.3f} ({status})")
+                
                 if should_trade:
                     buy_signals.append({
                         'coin': coin,
                         'probability': prob,
                         'timestamp': datetime.now()
                     })
-                    self.logger.info(f"BUY signal for {coin}: {prob:.3f}")
                 
             except Exception as e:
                 self.logger.error(f"Error checking signals for {coin}: {e}")
