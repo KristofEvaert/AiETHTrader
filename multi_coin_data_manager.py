@@ -60,12 +60,18 @@ class MultiCoinDataManager:
         if api_key and api_secret:
             if use_testnet:
                 self.client = Client(api_key, api_secret, testnet=True)
+                # Sync time with Binance servers to avoid timestamp errors
+                self.client.get_server_time()
             else:
                 self.client = Client(api_key, api_secret)
+                # Sync time with Binance servers to avoid timestamp errors
+                self.client.get_server_time()
             self.use_testnet = use_testnet
         else:
             # Use testnet for safety when no API keys provided
             self.client = Client(testnet=True)
+            # Sync time with Binance servers to avoid timestamp errors
+            self.client.get_server_time()
             self.use_testnet = True
         
         # Data cache: {coin: {timeframe: DataFrame}}
@@ -443,10 +449,11 @@ class MultiCoinDataManager:
             # Update every hour
             return True
         elif timeframe == '4h':
-            # Update every 4 hours (at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00)
+            # Update every hour to get current 4h candle data
             return True
         elif timeframe == '1d':
-            # Update daily at midnight
+            # Update every hour to get current day's incomplete candle
+            # This ensures daily indicators stay current throughout the day
             return True
         else:
             return True

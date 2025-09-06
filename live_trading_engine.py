@@ -159,15 +159,14 @@ class LiveTradingEngine:
         else:
             # Get real USDC balance from exchange
             try:
-                from binance.client import Client
-                client = Client(self.api_key, self.api_secret, testnet=self.config.get('exchange', {}).get('use_testnet', True))
+                client = self._get_synced_client()
                 account = client.get_account()
                 
                 # Find USDC balance
                 for balance in account['balances']:
                     if balance['asset'] == 'USDC':
                         usdc_balance = float(balance['free'])
-                        print(f"Real USDC balance: {usdc_balance:.2f}")  # Use print instead of logger
+                        print(f"Real USDC balance: {usdc_balance:.2f}")
                         return usdc_balance
                 
                 # If no USDC found, return 0
@@ -303,8 +302,7 @@ class LiveTradingEngine:
             return 0.0
         
         try:
-            from binance.client import Client
-            client = Client(self.api_key, self.api_secret, testnet=self.config.get('exchange', {}).get('use_testnet', True))
+            client = self._get_synced_client()
             
             # Get account info
             account = client.get_account()
@@ -355,6 +353,8 @@ class LiveTradingEngine:
             try:
                 from binance.client import Client
                 client = Client(self.api_key, self.api_secret, testnet=self.config.get('exchange', {}).get('use_testnet', True))
+                # Sync time with Binance servers to avoid timestamp errors
+                client.get_server_time()
                 ticker = client.get_symbol_ticker(symbol=coin)
                 return float(ticker['price'])
             except Exception as e:
@@ -502,11 +502,81 @@ class LiveTradingEngine:
             self.logger.info(f"[DRY RUN] SELL {coin_amount:.6f} {coin} for {usdc_before_fee:.2f} USDC (fee: {fee:.2f} USDC) at ${price:.2f}")
             return True, usdc_after_fee, fee
     
+    def _get_synced_client(self):
+        """Get a Binance client with proper timestamp synchronization."""
+        from binance.client import Client
+        import time
+        import hmac
+        import hashlib
+        import requests
+        
+        # Create client
+        client = Client(self.api_key, self.api_secret, testnet=self.config.get('exchange', {}).get('use_testnet', True))
+        
+        # Get server time and calculate offset
+        server_time = client.get_server_time()
+        local_time_ms = int(time.time() * 1000)
+        time_offset = server_time['serverTime'] - local_time_ms
+        print(f"Server time: {server_time['serverTime']}")
+        print(f"Local time: {local_time_ms}")
+        print(f"Time offset: {time_offset}ms")
+        
+        # Create a custom client that handles timestamp synchronization
+        class SyncedBinanceClient:
+            def __init__(self, client, time_offset, api_key, api_secret, use_testnet):
+                self.client = client
+                self.time_offset = time_offset
+                self.api_key = api_key
+                self.api_secret = api_secret
+                self.base_url = "https://testnet.binance.vision" if use_testnet else "https://api.binance.com"
+            
+            def _create_signature(self, query_string):
+                return hmac.new(
+                    self.api_secret.encode('utf-8'),
+                    query_string.encode('utf-8'),
+                    hashlib.sha256
+                ).hexdigest()
+            
+            def get_account(self, **params):
+                # Use direct API call with proper timestamp
+                # If time_offset is negative, local time is ahead, so subtract the offset
+                # If time_offset is positive, local time is behind, so add the offset
+                adjusted_timestamp = int(time.time() * 1000) + self.time_offset
+                params['timestamp'] = adjusted_timestamp
+                params['recvWindow'] = 10000
+                
+                # Create query string
+                query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
+                signature = self._create_signature(query_string)
+                
+                url = f"{self.base_url}/api/v3/account?{query_string}&signature={signature}"
+                headers = {'X-MBX-APIKEY': self.api_key}
+                
+                print(f"Adjusted timestamp: {adjusted_timestamp} (offset: {self.time_offset}ms)")
+                response = requests.get(url, headers=headers)
+                
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    raise Exception(f"API Error: {response.status_code} - {response.text}")
+            
+            def order_market_buy(self, **params):
+                # For now, use the original client for orders
+                return self.client.order_market_buy(**params)
+            
+            def order_market_sell(self, **params):
+                # For now, use the original client for orders
+                return self.client.order_market_sell(**params)
+            
+            def get_server_time(self):
+                return self.client.get_server_time()
+        
+        return SyncedBinanceClient(client, time_offset, self.api_key, self.api_secret, self.config.get('exchange', {}).get('use_testnet', True))
+
     def _execute_real_trade(self, coin: str, action: str, price: float, amount: float = None) -> tuple:
         """Execute real trade on exchange."""
         try:
-            from binance.client import Client
-            client = Client(self.api_key, self.api_secret, testnet=self.config.get('use_testnet', True))
+            client = self._get_synced_client()
             
             if action == 'buy':
                 if self.use_full_bankroll:
