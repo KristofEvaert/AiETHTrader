@@ -137,7 +137,6 @@ config/api_keys.json
 *.p12
 
 # Trading data and logs
-data/
 logs/
 *.log
 trades/
