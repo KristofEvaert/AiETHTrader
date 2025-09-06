@@ -1,0 +1,2 @@
+coin,total_samples,train_samples,test_samples,features,buy_signals,buy_percentage,final_accuracy,best_accuracy
+PEPEUSDC,8810,7048,1762,35,191,2.1679909194097617,0.9784336090087891,0.9784336090087891

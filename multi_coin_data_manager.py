@@ -117,11 +117,18 @@ class MultiCoinDataManager:
             for timeframe in self.timeframes:
                 self.logger.info(f"  Loading {timeframe} data for {coin}")
                 
-                # Load existing data if available
+                # Load existing data if available (new folder structure)
                 cache_file = f"{self.cache_dir}/{coin}_{timeframe}.csv"
+                data_file = f"{self.config['storage']['data_dir']}/{coin}/{timeframe}.csv"
+                
                 if os.path.exists(cache_file):
                     self.logger.info(f"    Loading existing {timeframe} data from cache")
                     df = pd.read_csv(cache_file)
+                    df['open_time'] = pd.to_datetime(df['open_time'])
+                    self.data_cache[coin][timeframe] = df
+                elif os.path.exists(data_file):
+                    self.logger.info(f"    Loading existing {timeframe} data from data folder")
+                    df = pd.read_csv(data_file)
                     df['open_time'] = pd.to_datetime(df['open_time'])
                     self.data_cache[coin][timeframe] = df
                 else:
@@ -221,6 +228,11 @@ class MultiCoinDataManager:
                 cache_file = f"{self.cache_dir}/{coin}_{timeframe}.csv"
                 self.data_cache[coin][timeframe].to_csv(cache_file, index=False)
                 self.logger.info(f"    Saved {coin} {timeframe} cache to {cache_file}")
+                
+                # Also save to data folder for backup
+                data_file = f"{self.config['storage']['data_dir']}/{coin}/{timeframe}.csv"
+                os.makedirs(os.path.dirname(data_file), exist_ok=True)
+                self.data_cache[coin][timeframe].to_csv(data_file, index=False)
     
     def get_latest_data(self, coin: str, timeframe: str) -> pd.DataFrame:
         """
@@ -432,10 +444,10 @@ class MultiCoinDataManager:
             return True
         elif timeframe == '4h':
             # Update every 4 hours (at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00)
-            return now.hour % 4 == 0
+            return True
         elif timeframe == '1d':
             # Update daily at midnight
-            return now.hour == 0
+            return True
         else:
             return True
     

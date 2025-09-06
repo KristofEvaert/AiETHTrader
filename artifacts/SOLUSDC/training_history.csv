@@ -1,0 +1,2 @@
+coin,total_samples,train_samples,test_samples,features,buy_signals,buy_percentage,final_accuracy,best_accuracy
+SOLUSDC,8810,7048,1762,35,56,0.6356413166855845,0.9937570691108704,0.9937570691108704

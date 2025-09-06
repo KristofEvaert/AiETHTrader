@@ -1,0 +1,2 @@
+coin,total_samples,train_samples,test_samples,features,buy_signals,buy_percentage,final_accuracy,best_accuracy
+HBARUSDC,6894,5515,1379,35,122,1.769654772265738,0.9825960993766785,0.9825960993766785

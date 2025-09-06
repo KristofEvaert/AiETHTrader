@@ -118,16 +118,26 @@ class LiveTradingEngine:
                 scaler_path = f"{artifacts_dir}/{coin}/scaler.pkl"
                 
                 if os.path.exists(model_path) and os.path.exists(scaler_path):
-                    model = TradingModel(input_size=35, hidden_size=256, dropout=0.3)
-                    model.load_state_dict(torch.load(model_path))
-                    model.eval()
+                    # Try different model architectures (prioritize 128 for new models)
+                    model = None
+                    for hidden_size in [128, 256]: # Try 128 first (new models), then 256 (old models)
+                        try:
+                            model = TradingModel(input_size=35, hidden_size=hidden_size, dropout=0.3)
+                            model.load_state_dict(torch.load(model_path))
+                            model.eval()
+                            print(f"Loaded {coin} model with hidden_size={hidden_size}")
+                            break
+                        except Exception as e:
+                            continue
+                    
+                    if model is None:
+                        print(f"ERROR: Could not load model for {coin} - architecture mismatch")
+                        continue
                     
                     scaler = joblib.load(scaler_path)
                     
                     self.models[coin] = model
                     self.scalers[coin] = scaler
-                    
-                    print(f"Loaded model for {coin}")
                 else:
                     print(f"WARNING: Model files not found for {coin}")
                     
@@ -221,10 +231,10 @@ class LiveTradingEngine:
     
     def create_multi_timeframe_features(self, df_1h, df_4h, df_1d):
         """Create multi-timeframe features."""
-        # Align timeframes
-        df_1h['datetime'] = pd.to_datetime(df_1h['open_time'])
-        df_4h['datetime'] = pd.to_datetime(df_4h['open_time'])
-        df_1d['datetime'] = pd.to_datetime(df_1d['open_time'])
+        # Align timeframes and ensure timezone-naive
+        df_1h['datetime'] = pd.to_datetime(df_1h['open_time']).dt.tz_localize(None)
+        df_4h['datetime'] = pd.to_datetime(df_4h['open_time']).dt.tz_localize(None)
+        df_1d['datetime'] = pd.to_datetime(df_1d['open_time']).dt.tz_localize(None)
         
         # Add technical indicators
         df_1h = self.add_technical_indicators(df_1h)

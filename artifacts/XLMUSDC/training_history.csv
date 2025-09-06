@@ -1,0 +1,2 @@
+coin,total_samples,train_samples,test_samples,features,buy_signals,buy_percentage,final_accuracy,best_accuracy
+XLMUSDC,8810,7048,1762,35,85,0.9648127128263337,0.9903518557548523,0.9903518557548523

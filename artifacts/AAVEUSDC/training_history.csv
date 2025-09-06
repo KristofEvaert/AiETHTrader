@@ -1,0 +1,2 @@
+coin,total_samples,train_samples,test_samples,features,buy_signals,buy_percentage,final_accuracy,best_accuracy
+AAVEUSDC,8790,7032,1758,35,116,1.3196814562002275,0.9869169592857361,0.9869169592857361

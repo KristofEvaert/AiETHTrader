@@ -1,0 +1,2 @@
+coin,total_samples,train_samples,test_samples,features,buy_signals,buy_percentage,final_accuracy,best_accuracy
+AVAXUSDC,8810,7048,1762,35,60,0.681044267877412,0.9931895732879639,0.9931895732879639

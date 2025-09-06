@@ -1,0 +1,2 @@
+coin,total_samples,train_samples,test_samples,features,buy_signals,buy_percentage,final_accuracy,best_accuracy
+PENGUUSDC,6246,4996,1250,35,300,4.803073967339097,0.9520000219345093,0.9520000219345093

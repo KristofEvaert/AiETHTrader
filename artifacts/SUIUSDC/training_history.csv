@@ -1,0 +1,2 @@
+coin,total_samples,train_samples,test_samples,features,buy_signals,buy_percentage,final_accuracy,best_accuracy
+SUIUSDC,8810,7048,1762,35,165,1.872871736662883,0.9812712669372559,0.9812712669372559
